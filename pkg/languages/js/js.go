@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/containers/image/types"
+	"github.com/pkg/errors"
+
 	"github.com/slinkydeveloper/kfn/pkg/config"
 	"github.com/slinkydeveloper/kfn/pkg/image"
 	"github.com/slinkydeveloper/kfn/pkg/languages"
@@ -15,7 +17,10 @@ import (
 )
 
 const (
-	baseImage = "oscf/js-runtime:0.0.2"
+	baseImage             = "oscf/js-runtime:0.0.2"
+	npmScriptVariable     = "npm-script"
+	devDependencyVariable = "dev-dependency"
+	testFrameworkVariable = "test-framework"
 )
 
 type jsLanguageManager struct {
@@ -133,7 +138,41 @@ func (j jsLanguageManager) ConfigureTargetDirectory(mainFile string, functionCon
 		return err
 	}
 
+	// Configure test file
+	testFile := util.UnitTestFile(mainFile)
+	if util.FsExist(testFile) {
+		err = util.MkdirpIfNotExists(path.Join(targetDirectory, "usr", "test"))
+		if err != nil {
+			return err
+		}
+
+		err := util.Copy(testFile, path.Join(targetDirectory, "usr", "test", "index_test.js"))
+		if err != nil {
+			return err
+		}
+	}
+
 	return util.Copy(runtimeDirectory(), path.Join(targetDirectory, "src"))
+}
+
+func (r jsLanguageManager) UnitTest(mainFile string, functionConfiguration map[string][]string, targetDirectory string) error {
+	err := util.CommandsExists("npm")
+	if err != nil {
+		return err
+	}
+
+	// npm install --only=dev to install test framework
+	err = util.RunCommand("npm", []string{"install", "--only=dev"}, path.Join(targetDirectory, "usr"))
+	if err != nil {
+		return err
+	}
+
+	err = util.RunCommand("npm", []string{"test"}, path.Join(targetDirectory, "usr"))
+	if err != nil {
+		return errors.Wrap(err, "error occurred while testing function")
+	}
+
+	return nil
 }
 
 func runtimeDirectory() string {
@@ -147,19 +186,58 @@ func generatePackageJson(configurationEntries map[string][]string) ([]byte, erro
 	root["version"] = "0.0.1"
 	root["description"] = ""
 
-	depsRoot := make(map[string]string)
+	// First, apply the test-framework variable
+	var tf string
+	if tfArray, ok := configurationEntries[testFrameworkVariable]; ok && len(tfArray) == 1 {
+		tf = strings.Trim(tfArray[0], " ")
+	}
+	for _, f := range getTestFrameworkPackageJsonConfig(tf) {
+		f(root)
+	}
+
+	// Now let's apply custom deps
+	depsRoot := util.GetNestedMap(root, "dependencies")
+	devDepsRoot := util.GetNestedMap(root, "devDependencies")
 
 	if deps, ok := configurationEntries[util.DEPENDENCY]; ok {
 		for _, dep := range deps {
 			splitted := strings.Split(dep, " ")
-			if len(splitted) != 2 {
-				return nil, fmt.Errorf("Invalid dependency entry: %v", dep)
+			if len(splitted) == 2 {
+				depsRoot[strings.Trim(splitted[0], " ")] = strings.Trim(splitted[1], " ")
+			} else if len(splitted) == 1 {
+				pkgName := strings.Trim(splitted[0], " ")
+				depsRoot[pkgName] = mustGetLatestNpmPackageVersionOrLatest(pkgName)
+			} else {
+				return nil, fmt.Errorf("invalid dependency entry: %v", dep)
 			}
-			depsRoot[strings.Trim(splitted[0], " ")] = strings.Trim(splitted[1], " ")
 		}
 	}
 
-	root["dependencies"] = depsRoot
+	if deps, ok := configurationEntries[devDependencyVariable]; ok {
+		for _, dep := range deps {
+			splitted := strings.Split(dep, " ")
+			if len(splitted) == 2 {
+				devDepsRoot[strings.Trim(splitted[0], " ")] = strings.Trim(splitted[1], " ")
+			} else if len(splitted) == 1 {
+				pkgName := strings.Trim(splitted[0], " ")
+				devDepsRoot[pkgName] = mustGetLatestNpmPackageVersionOrLatest(pkgName)
+			} else {
+				return nil, fmt.Errorf("invalid dev dependency entry: %v", dep)
+			}
+		}
+	}
 
+	// Now let's check custom scripts
+	scriptsRoot := util.GetNestedMap(root, "scripts")
+	if scripts, ok := configurationEntries[npmScriptVariable]; ok {
+		for _, script := range scripts {
+			splitted := strings.SplitN(script, " ", 2)
+			if len(splitted) == 2 {
+				scriptsRoot[strings.Trim(splitted[0], " ")] = strings.Trim(splitted[1], " ")
+			} else {
+				return nil, fmt.Errorf("invalid script entry: %v", script)
+			}
+		}
+	}
 	return json.MarshalIndent(root, "", "  ")
 }
